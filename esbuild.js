@@ -231,6 +231,7 @@ const nodeStubPlugin = {
             'https',
             'os',
             'crypto',
+            'dgram',
         ];
 
         for (const mod of stubs) {
