@@ -195,9 +195,9 @@ async function executeInSandbox(script, name, api) {
         // 复刻上游 new Function() 行为：
         //   body = `${script}\n return ${name}`
         //
-        // 用 IIFE 包裹：先执行 script（定义函数），再返回名为 name 的函数
-        // 添加分号确保 script 语句结束，避免 ASI 陷阱
-        var wrappedScript = '(function(){\n' + script + ';\nreturn ' + name + ';\n})()';
+        // 用 IIFE 包裹：先执行 script（定义函数），再返回名为 name 的函数。
+        // 注意：用户脚本可能含注释行和多种声明，func 模式失败后会自动回退 nodeFunc。
+        var wrappedScript = '(function(){\n' + script + '\nreturn ' + name + ';\n})()';
         var evalResult = context.evalCode(wrappedScript);
 
         if (evalResult.error) {
@@ -330,6 +330,17 @@ function serializeArgs(context, args) {
 }
 
 /**
+ * 判断是否为 mihomoProfile 类型（检查 $file.type === 'mihomoProfile'）
+ */
+function isMihomoProfile(proxies) {
+    try {
+        return !!(proxies && proxies.$file && proxies.$file.type === 'mihomoProfile');
+    } catch (e) {
+        return false;
+    }
+}
+
+/**
  * Script Operator / Script Filter 执行器
  *
  * 替代 createDynamicFunction 的 new Function() 方案。
@@ -337,11 +348,18 @@ function serializeArgs(context, args) {
  *   function(proxies, targetPlatform, context, ...extraArgs)
  *
  * 执行策略（复刻上游 ApplyFilter / ApplyOperator）：
- *   1. 先尝试 func 模式：IIFE 包裹脚本 → fn(proxies, targetPlatform, context)
- *      用户脚本应定义 function filter(proxies, ...) 返回 boolean[]
- *   2. 若 func 模式失败且错误含 "$server is not defined"，
- *      回退 nodeFunc 模式：将用户脚本包装为快捷脚本遍历
- *      每个 $server 是单个 proxy 节点
+ *   1. func 模式：IIFE 包裹脚本 → 返回 function → fn(proxies, targetPlatform, context)
+ *      用户脚本应定义 function operator/filter(proxies, ...)
+ *   2. nodeFunc 模式（回退）：将用户脚本包装为快捷脚本遍历
+ *      - filter: const fn = async ($server) => { script } → list.push(await fn($server))
+ *        每个 $server 是单个 proxy 节点，fn 返回 boolean
+ *      - operator: for (let $server of proxies) { script; list.push($server) }
+ *        每个 $server 是单个 proxy 节点，用户直接修改它的属性
+ *
+ * 回退触发条件（复刻上游 ApplyFilter/ApplyOperator）：
+ *   - filter: func 失败且错误含 "$server is not defined"
+ *   - operator: func 失败且错误含 "$server/$content/$files is not defined"
+ *     或 output?.$files / output?.$content 为真
  *
  * @param {string} script - 用户脚本
  * @param {string} name - 函数名（'filter' / 'operator' / 'transformFunction'）
@@ -352,6 +370,10 @@ function serializeArgs(context, args) {
 function createScriptFunction(script, name, $arguments, $options) {
     return async function () {
         var args = arguments;
+        var proxies = args[0];       // args[0] = proxies
+        var targetPlatform = args[1];
+        var context = args[2];
+
         var api = {
             $arguments: $arguments || {},
             $options: $options || {},
@@ -371,30 +393,166 @@ function createScriptFunction(script, name, $arguments, $options) {
             }
         }
 
-        // ========== func 模式（仅支持函数式脚本） ==========
-        // 用户脚本必须定义 function filter(proxies, targetPlatform, context)
-        // 返回的函数通过 IIFE 包裹后调用：fn(proxies, targetPlatform, context)
-        // 上游 nodeFunc 模式不做过滤回退（nodeFunc 仅用于修改节点），
-        // 脚本过滤只支持函数式写法。
+        // 注入 $content/$files 默认值（nodeFunc 模式需要）
+        var _hasContent = !!(
+            (proxies && proxies.$content) || (proxies && proxies.$files)
+        );
+
+        // ========== func 模式 ==========
         try {
             var sandbox = await executeInSandbox(script, name, api);
-            var context = sandbox.context;
-            var runtime = sandbox.runtime;
-            var fnHandle = sandbox.fnHandle;
+            var _ctx = sandbox.context;
+            var _rt = sandbox.runtime;
+            var _fn = sandbox.fnHandle;
 
             try {
-                var callArgs = serializeArgs(context, args);
-                var result = await callSandboxFunction(context, runtime, fnHandle, callArgs);
-                return result;
+                var _callArgs = serializeArgs(_ctx, args);
+                var _result = await callSandboxFunction(_ctx, _rt, _fn, _callArgs);
+                return _result;
             } finally {
-                try { fnHandle.dispose(); } catch (e) { /* ignore */ }
-                try { context.dispose(); } catch (e) { /* ignore */ }
+                try { _fn.dispose(); } catch (e) { /* ignore */ }
+                try { _ctx.dispose(); } catch (e) { /* ignore */ }
             }
-        } catch (err) {
-            var errMsg = (err && err.message) ? err.message : String(err);
-            throw new Error('脚本执行失败：' + errMsg);
+        } catch (funcErr) {
+            var funcErrMsg = (funcErr && funcErr.message) ? funcErr.message : String(funcErr);
+
+            // 判断是否应该回退 nodeFunc
+            var shouldFallback = false;
+            if (name === 'filter') {
+                // filter 回退条件：错误含 "$server is not defined" 或 "'$server' is not defined"
+                if (funcErrMsg.indexOf("$server is not defined") !== -1 ||
+                    funcErrMsg.indexOf("'$server' is not defined") !== -1) {
+                    shouldFallback = true;
+                }
+            } else {
+                // operator 回退条件（复刻 ApplyOperator L1249-1258）：
+                //   错误含 "$server" / "$content" / "$files" is not defined
+                //   或 output?.$files / output?.$content 为真
+                if (
+                    funcErrMsg.indexOf("$server is not defined") !== -1 ||
+                    funcErrMsg.indexOf("'$server' is not defined") !== -1 ||
+                    funcErrMsg.indexOf("$content is not defined") !== -1 ||
+                    funcErrMsg.indexOf("$files is not defined") !== -1 ||
+                    _hasContent
+                ) {
+                    shouldFallback = true;
+                }
+            }
+
+            if (!shouldFallback) {
+                throw new Error('脚本执行失败：' + funcErrMsg);
+            }
+
+            // ========== nodeFunc 模式 ==========
+            try {
+                return await executeNodeFunc(script, name, api, proxies, targetPlatform, context);
+            } catch (nodeErr) {
+                var nodeErrMsg = (nodeErr && nodeErr.message) ? nodeErr.message : String(nodeErr);
+                if (nodeErrMsg === funcErrMsg) {
+                    throw new Error('执行失败 ' + funcErrMsg);
+                }
+                throw new Error('脚本执行失败：' + nodeErrMsg);
+            }
         }
     };
+}
+
+/**
+ * nodeFunc 模式：将用户脚本包装为快捷遍历脚本执行
+ *
+ * 复刻上游 ScriptFilter.nodeFunc / ScriptOperator.nodeFunc：
+ *
+ * filter nodeFunc:
+ *   async function filter(input = [], targetPlatform, context) {
+ *       let proxies = input
+ *       let list = []
+ *       const fn = async ($server) => { ${script} }
+ *       for (var _i = 0; _i < proxies.length; _i++) {
+ *           list.push(await fn(proxies[_i]))
+ *       }
+ *       return list
+ *   }
+ *
+ * operator nodeFunc (无 $files/$content):
+ *   async function operator(input = [], targetPlatform, context) {
+ *       let proxies = input
+ *       let list = []
+ *       for (var _i = 0; _i < proxies.length; _i++) {
+ *           var $server = proxies[_i];
+ *           ${script};
+ *           list.push($server);
+ *       }
+ *       return list
+ *   }
+ *
+ * @param {string} script - 用户脚本
+ * @param {string} name - 函数名
+ * @param {object} api - API 对象
+ * @param {Array} proxies - 代理节点数组
+ * @param {string} targetPlatform - 目标平台
+ * @param {object} context - 上下文对象
+ * @returns {*} 执行结果
+ */
+async function executeNodeFunc(script, name, api, proxies, targetPlatform, context) {
+    var wrapperScript;
+    if (name === 'filter') {
+        // filter nodeFunc: fn($server) 返回 boolean，收集到 list
+        // 注意：上游官方 filter nodeFunc 中 fn 没有 return，list 收集的是
+        // fn($server) 的返回值。但快捷脚本如 $server.name.includes('香港')
+        // 是表达式而非语句，需要 return 才能作为 fn 的返回值。
+        // 因此与上游略有不同：fn 体内加 return。
+        wrapperScript =
+            'async function filter(input, targetPlatform, context) {\n' +
+            '  var proxies = input;\n' +
+            '  var list = [];\n' +
+            '  var fn = async function($server) {\n' +
+            '    return ' + script + ';\n' +
+            '  };\n' +
+            '  for (var _i = 0; _i < proxies.length; _i++) {\n' +
+            '    list.push(await fn(proxies[_i]));\n' +
+            '  }\n' +
+            '  return list;\n' +
+            '}';
+    } else {
+        // operator nodeFunc: 遍历 proxies，每轮执行 script 修改 $server
+        // 复刻上游：for (let $server of proxies) { script; } 后过滤 isFalsy
+        wrapperScript =
+            'async function operator(input, targetPlatform, context) {\n' +
+            '  var proxies = input;\n' +
+            '  var list = [];\n' +
+            '  for (var _i = 0; _i < proxies.length; _i++) {\n' +
+            '    var $server = proxies[_i];\n' +
+            script + ';\n' +
+            '    if ($server != null && $server !== false) {\n' +
+            '      list.push($server);\n' +
+            '    }\n' +
+            '  }\n' +
+            '  return list;\n' +
+            '}';
+    }
+
+    // 注入 $content/$files 默认值（operator nodeFunc 依赖这些变量）
+    if (name !== 'filter') {
+        api.$content = (proxies && proxies.$content) ? proxies.$content : '';
+        api.$files = (proxies && proxies.$files) ? proxies.$files : [];
+    } else {
+        api.$content = '';
+        api.$files = [];
+    }
+
+    var sandbox = await executeInSandbox(wrapperScript, name, api);
+    var _ctx = sandbox.context;
+    var _rt = sandbox.runtime;
+    var _fn = sandbox.fnHandle;
+
+    try {
+        var callArgs = serializeArgs(_ctx, [proxies, targetPlatform, context]);
+        var result = await callSandboxFunction(_ctx, _rt, _fn, callArgs);
+        return result;
+    } finally {
+        try { _fn.dispose(); } catch (e) { /* ignore */ }
+        try { _ctx.dispose(); } catch (e) { /* ignore */ }
+    }
 }
 
 module.exports = {
